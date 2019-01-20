@@ -24,9 +24,9 @@ import (
 var ssaConfig *ssa.Config
 var ssaCaches []ssa.Cache
 
-var ssaDump string     // early copy of $GOSSAFUNC; the func name to dump output for
-var ssaDumpStdout bool // whether to dump to stdout
-var ssaDumpCFG string  // generate CFGs for these phases
+var ssaDump string       // early copy of $GOSSAFUNC; the func name to dump output for
+var ssaDumpStdout = true // whether to dump to stdout
+var ssaDumpCFG string    // generate CFGs for these phases
 const ssaDumpFile = "ssa.html"
 
 // ssaDumpInlined holds all inlined functions when ssaDump contains a function name.

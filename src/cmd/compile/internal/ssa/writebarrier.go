@@ -266,7 +266,7 @@ func writebarrier(f *Func) {
 			}
 		}
 		for _, w := range stores {
-			if w != last {
+			if w != last && w.Uses == 0 {
 				f.freeValue(w)
 			}
 		}

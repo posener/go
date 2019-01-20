@@ -388,6 +388,7 @@ var passes = [...]pass{
 	{name: "opt", fn: opt, required: true},               // TODO: split required rules and optimizing rules
 	{name: "zero arg cse", fn: zcse, required: true},     // required to merge OpSB values
 	{name: "opt deadcode", fn: deadcode, required: true}, // remove any blocks orphaned during opt
+	{name: "optimize memory dependency", fn: optimizeMemoryDependency, required: true},
 	{name: "generic cse", fn: cse},
 	{name: "phiopt", fn: phiopt},
 	{name: "nilcheckelim", fn: nilcheckelim},
