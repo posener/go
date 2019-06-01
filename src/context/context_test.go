@@ -110,7 +110,7 @@ func XTestWithCancel(t testingT) {
 	}
 }
 
-func contains(m map[canceler]struct{}, key canceler) bool {
+func contains(m map[cancelable]struct{}, key cancelable) bool {
 	_, ret := m[key]
 	return ret
 }
@@ -149,11 +149,11 @@ func XTestParentFinishesChild(t testingT) {
 	}
 	pc.mu.Unlock()
 
-	if p, ok := parentCancelCtx(cc.Context); !ok || p != pc {
-		t.Errorf("bad linkage: parentCancelCtx(cancelChild.Context) = %v, %v want %v, true", p, ok, pc)
+	if p := lookupCanceler(cc.Context); p != pc {
+		t.Errorf("bad linkage: lookupCanceler(cancelChild.Context) = %v want %v", p, pc)
 	}
-	if p, ok := parentCancelCtx(tc.Context); !ok || p != pc {
-		t.Errorf("bad linkage: parentCancelCtx(timerChild.Context) = %v, %v want %v, true", p, ok, pc)
+	if p := lookupCanceler(tc.Context); p != pc {
+		t.Errorf("bad linkage: lookupCanceler(timerChild.Context) = %v want %v", p, pc)
 	}
 
 	cancel()
@@ -208,8 +208,15 @@ func XTestChildFinishesFirst(t testingT) {
 
 		cc := child.(*cancelCtx)
 		pc, pcok := parent.(*cancelCtx) // pcok == false when parent == Background()
-		if p, ok := parentCancelCtx(cc.Context); ok != pcok || (ok && pc != p) {
-			t.Errorf("bad linkage: parentCancelCtx(cc.Context) = %v, %v want %v, %v", p, ok, pc, pcok)
+		p := lookupCanceler(cc.Context)
+		if pcok {
+			if pc != p {
+				t.Errorf("bad linkage: lookupCanceler(cc.Context) = %v want %v", p, pc)
+			}
+		} else {
+			if _, ok := p.(*cancelerCtx); !ok {
+				t.Errorf("bad linkage: lookupCanceler(cc.Context).(type) = %T want *cancelerCtx", p)
+			}
 		}
 
 		if pcok {

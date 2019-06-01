@@ -232,8 +232,8 @@ type CancelFunc func()
 // call cancel as soon as the operations running in this Context complete.
 func WithCancel(parent Context) (ctx Context, cancel CancelFunc) {
 	c := newCancelCtx(parent)
-	propagateCancel(parent, &c)
-	return &c, func() { c.cancel(true, Canceled) }
+	c.link = newLink(parent, &c)
+	return &c, func() { c.cancelAndUnlink(Canceled) }
 }
 
 // newCancelCtx returns an initialized cancelCtx.
@@ -241,70 +241,46 @@ func newCancelCtx(parent Context) cancelCtx {
 	return cancelCtx{Context: parent}
 }
 
-// propagateCancel arranges for child to be canceled when parent is.
-func propagateCancel(parent Context, child canceler) {
-	if parent.Done() == nil {
-		return // parent is never canceled
-	}
-	if p, ok := parentCancelCtx(parent); ok {
-		p.mu.Lock()
-		if p.err != nil {
-			// parent has already been canceled
-			child.cancel(false, p.err)
-		} else {
-			if p.children == nil {
-				p.children = make(map[canceler]struct{})
-			}
-			p.children[child] = struct{}{}
-		}
-		p.mu.Unlock()
-	} else {
-		go func() {
-			select {
-			case <-parent.Done():
-				child.cancel(false, parent.Err())
-			case <-child.Done():
-			}
-		}()
-	}
+// canceler is an optional interface for a context type for propagating
+// cancellation. If a context implementation want to manage context
+// cancellation, it needs to cancel all its children when cancelled.
+// This interface provides a way for a child to register itself in a
+// parent context.
+type canceler interface {
+	// Register a new cancelable child for a context.
+	Register(cancelable)
+	// Unregister existing cancelable child.
+	Unregister(cancelable)
 }
 
-// parentCancelCtx follows a chain of parent references until it finds a
-// *cancelCtx. This function understands how each of the concrete types in this
-// package represents its parent.
-func parentCancelCtx(parent Context) (*cancelCtx, bool) {
+// cancelable is an optional interface for a context type that can be canceled
+// directly.
+type cancelable interface {
+	Cancel(err error)
+	Done() <-chan struct{}
+}
+
+// child is an optional interface for a context type in which it returns its
+// parent context. It is useful for context to expose this interface to prevent
+// an extra goroutine when being called with a cancelable context conversion.
+type child interface {
+	// Return the parent context of a context.
+	Parent() Context
+}
+
+// lookupCanceler follows a chain of parent references until it finds a
+// canceler.
+func lookupCanceler(parent Context) canceler {
 	for {
 		switch c := parent.(type) {
-		case *cancelCtx:
-			return c, true
-		case *timerCtx:
-			return &c.cancelCtx, true
-		case *valueCtx:
-			parent = c.Context
+		case canceler:
+			return c
+		case child:
+			parent = c.Parent()
 		default:
-			return nil, false
+			return &cancelerCtx{Context: parent}
 		}
 	}
-}
-
-// removeChild removes a context from its parent.
-func removeChild(parent Context, child canceler) {
-	p, ok := parentCancelCtx(parent)
-	if !ok {
-		return
-	}
-	p.mu.Lock()
-	if p.children != nil {
-		delete(p.children, child)
-	}
-	p.mu.Unlock()
-}
-
-// A canceler is a context type that can be canceled directly. The
-// implementations are *cancelCtx and *timerCtx.
-type canceler interface {
-	cancel(removeFromParent bool, err error)
-	Done() <-chan struct{}
 }
 
 // closedchan is a reusable closed channel.
@@ -314,15 +290,39 @@ func init() {
 	close(closedchan)
 }
 
+// link maintains a link between a child cancelable to a parent canceler.
+type link struct {
+	parent canceler
+	child  cancelable
+}
+
+func newLink(parent Context, child cancelable) link {
+	if parent.Done() == nil {
+		return link{} // parent is never canceled
+	}
+	c := lookupCanceler(parent)
+	c.Register(child)
+	return link{parent: c, child: child}
+}
+
+func (l *link) unlink() {
+	if l.parent != nil {
+		l.parent.Unregister(l.child)
+		l.parent = nil
+		l.child = nil
+	}
+}
+
 // A cancelCtx can be canceled. When canceled, it also cancels any children
 // that implement canceler.
 type cancelCtx struct {
 	Context
 
-	mu       sync.Mutex            // protects following fields
-	done     chan struct{}         // created lazily, closed by first cancel call
-	children map[canceler]struct{} // set to nil by the first cancel call
-	err      error                 // set to non-nil by the first cancel call
+	mu       sync.Mutex              // protects following fields
+	done     chan struct{}           // created lazily, closed by first cancel call
+	children map[cancelable]struct{} // set to nil by the first cancel call
+	err      error                   // set to non-nil by the first cancel call
+	link     link
 }
 
 func (c *cancelCtx) Done() <-chan struct{} {
@@ -342,6 +342,29 @@ func (c *cancelCtx) Err() error {
 	return err
 }
 
+func (c *cancelCtx) Register(child cancelable) {
+	c.mu.Lock()
+	if c.err != nil {
+		// parent has already been canceled
+		child.Cancel(c.err)
+	} else {
+		if c.children == nil {
+			c.children = make(map[cancelable]struct{})
+		}
+		c.children[child] = struct{}{}
+	}
+	c.mu.Unlock()
+}
+
+// Unregister removes a context from the context.
+func (c *cancelCtx) Unregister(child cancelable) {
+	c.mu.Lock()
+	if c.children != nil {
+		delete(c.children, child)
+	}
+	c.mu.Unlock()
+}
+
 type stringer interface {
 	String() string
 }
@@ -357,9 +380,9 @@ func (c *cancelCtx) String() string {
 	return contextName(c.Context) + ".WithCancel"
 }
 
-// cancel closes c.done, cancels each of c's children, and, if
+// Cancel closes c.done, cancels each of c's children, and, if
 // removeFromParent is true, removes c from its parent's children.
-func (c *cancelCtx) cancel(removeFromParent bool, err error) {
+func (c *cancelCtx) Cancel(err error) {
 	if err == nil {
 		panic("context: internal error: missing cancel error")
 	}
@@ -376,14 +399,17 @@ func (c *cancelCtx) cancel(removeFromParent bool, err error) {
 	}
 	for child := range c.children {
 		// NOTE: acquiring the child's lock while holding parent's lock.
-		child.cancel(false, err)
+		child.Cancel(err)
 	}
 	c.children = nil
 	c.mu.Unlock()
+}
 
-	if removeFromParent {
-		removeChild(c.Context, c)
-	}
+func (c *cancelCtx) cancelAndUnlink(err error) {
+	c.Cancel(err)
+	c.mu.Lock()
+	c.link.unlink()
+	c.mu.Unlock()
 }
 
 // WithDeadline returns a copy of the parent context with the deadline adjusted
@@ -404,20 +430,20 @@ func WithDeadline(parent Context, d time.Time) (Context, CancelFunc) {
 		cancelCtx: newCancelCtx(parent),
 		deadline:  d,
 	}
-	propagateCancel(parent, c)
+	c.link = newLink(parent, c)
 	dur := time.Until(d)
 	if dur <= 0 {
-		c.cancel(true, DeadlineExceeded) // deadline has already passed
-		return c, func() { c.cancel(false, Canceled) }
+		c.cancelAndUnlink(DeadlineExceeded) // deadline has already passed
+		return c, func() { c.Cancel(Canceled) }
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.err == nil {
 		c.timer = time.AfterFunc(dur, func() {
-			c.cancel(true, DeadlineExceeded)
+			c.cancelAndUnlink(DeadlineExceeded)
 		})
 	}
-	return c, func() { c.cancel(true, Canceled) }
+	return c, func() { c.cancelAndUnlink(Canceled) }
 }
 
 // A timerCtx carries a timer and a deadline. It embeds a cancelCtx to
@@ -440,12 +466,8 @@ func (c *timerCtx) String() string {
 		time.Until(c.deadline).String() + "])"
 }
 
-func (c *timerCtx) cancel(removeFromParent bool, err error) {
-	c.cancelCtx.cancel(false, err)
-	if removeFromParent {
-		// Remove this timerCtx from its parent cancelCtx's children.
-		removeChild(c.cancelCtx.Context, c)
-	}
+func (c *timerCtx) Cancel(err error) {
+	c.cancelCtx.Cancel(err)
 	c.mu.Lock()
 	if c.timer != nil {
 		c.timer.Stop()
@@ -522,4 +544,28 @@ func (c *valueCtx) Value(key interface{}) interface{} {
 		return c.val
 	}
 	return c.Context.Value(key)
+}
+
+func (c *valueCtx) Parent() Context {
+	return c.Context
+}
+
+// cancelerCtx wraps a context and implement the canceler interface
+// by invoking a goroutine for every registered cancelable.
+type cancelerCtx struct {
+	Context
+}
+
+func (r *cancelerCtx) Register(child cancelable) {
+	go func() {
+		select {
+		case <-r.Done():
+			child.Cancel(r.Err())
+		case <-child.Done():
+		}
+	}()
+}
+
+func (r *cancelerCtx) Unregister(child cancelable) {
+
 }
